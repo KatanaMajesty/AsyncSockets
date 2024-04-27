@@ -44,7 +44,7 @@ namespace AsyncTask
             uint32_t NumBytes = 0;
 
             // chunks allow to split task execution into multiple threads
-            ByteBuffer Buffer;
+            ByteBuffer Buffer = nullptr;
         };
 
         // BodyPartition struct allows to split task execution into multiple threads on server
@@ -79,6 +79,8 @@ namespace AsyncTask
             ASOCK_THROW_IF_FALSE( m_client.Write(bodyPartition.size()) == sizeof(size_t) );
             for (const BodyChunk& chunk: bodyPartition)
             {
+                // firstly write amount of bytes in chunk
+                ASOCK_THROW_IF_FALSE( m_client.Write(chunk.NumBytes) == sizeof(uint32_t) );
                 if (m_client.Write(chunk.Buffer, chunk.NumBytes) != chunk.NumBytes)
                 {
                     ASOCK_LOG("Client -> Critical! Failed to upload body chunk data of size {}! Aborting...\n", chunk.NumBytes);

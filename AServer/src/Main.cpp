@@ -48,8 +48,8 @@ int32_t main()
         size_t NumRows;
     };
 
-    AsyncTask::ServerTaskHandler<MatrixTaskHeader, MatrixType::ValueType> serverTaskHandler;
-    serverTaskHandler.Init();
+    AsyncTask::ServerTaskHandler<MatrixTaskHeader> serverTaskHandler;
+    serverTaskHandler.Init(std::thread::hardware_concurrency());
     serverTaskHandler.Wait();
 
     AsyncSock::Cleanup();

@@ -3,6 +3,7 @@
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <memory>
 #include "AsyncSock.h"
 
 #include "ThreadPool.h"
@@ -28,26 +29,23 @@ namespace AsyncTask
     };
 
     template<typename T>
-    concept IsHeaderType = std::is_trivially_copyable_v<T>;
+    concept IsTriviallyCopyable = std::is_trivially_copyable_v<T>;
 
-    template<IsHeaderType HeaderType, typename BodyType, uint8_t NumTaskThreads = 4>
+    template<IsTriviallyCopyable HeaderType>
     class ServerTaskHandler
     {
     public:
-        using TaskFunctor = std::function<void(const HeaderType& header, const std::vector<std::byte>& body)>;
+        using TaskFunctor = std::function<void(const HeaderType& header, const std::vector<uint8_t>& body)>;
 
-        ServerTaskHandler()
-            : m_threadPool(std::thread::hardware_concurrency()) // initialize with number of CPU concurrent threads
-        {
-        }
+        ServerTaskHandler() = default;
         
-        ~ServerTaskHandler()
+        inline ~ServerTaskHandler()
         {
             Wait();
-            m_threadPool.Terminate();
+            m_workerThreadPool->Terminate();
         }
 
-        void Init();
+        void Init(uint32_t numWorkerThreads);
         void Wait()
         {
             if (m_clientThread.joinable())
@@ -55,6 +53,10 @@ namespace AsyncTask
         }
 
     private:
+        // BodyChunk is solely for internal use (unlike one the Client side of the API)
+        // Also quite differs from the client side, as it is basically just an array of bytes
+        using BodyChunk = std::vector<uint8_t>;
+
         void UpdateClients();
         void ProcessClientRequest(AsyncSock::ISocketCommunicator* client, ERequestType type);
         bool ProcessTaskSubmition(AsyncSock::ISocketCommunicator* client);
@@ -63,11 +65,11 @@ namespace AsyncTask
 
         AsyncSock::Server m_server;
         std::thread m_clientThread;
-        ThreadPool m_threadPool;
+        std::unique_ptr<ThreadPool> m_workerThreadPool;
     };
 
-    template<IsHeaderType HeaderType, typename BodyType, uint8_t NumTaskThreads>
-    inline void ServerTaskHandler<HeaderType, BodyType, NumTaskThreads>::Init()
+    template<IsTriviallyCopyable  HeaderType>
+    inline void ServerTaskHandler<HeaderType>::Init(uint32_t numWorkerThreads)
     {
         if (!m_server.Init(AsyncSock::BindInfo{}))
         {
@@ -80,10 +82,11 @@ namespace AsyncTask
             m_server.GetBindInfo().AddressPort);
 
         m_clientThread = std::thread(&ServerTaskHandler::UpdateClients, this);
+        m_workerThreadPool = std::make_unique<ThreadPool>(numWorkerThreads);
     }
 
-    template<IsHeaderType HeaderType, typename BodyType, uint8_t NumTaskThreads>
-    inline void ServerTaskHandler<HeaderType, BodyType, NumTaskThreads>::UpdateClients()
+    template<IsTriviallyCopyable  HeaderType>
+    inline void ServerTaskHandler<HeaderType>::UpdateClients()
     {
         // while not terminated, wait for connections and play around :)
         while (true)
@@ -104,8 +107,8 @@ namespace AsyncTask
         }
     }
 
-    template<IsHeaderType HeaderType, typename BodyType, uint8_t NumTaskThreads>
-    inline void ServerTaskHandler<HeaderType, BodyType, NumTaskThreads>::ProcessClientRequest(AsyncSock::ISocketCommunicator* client, ERequestType type)
+    template<IsTriviallyCopyable  HeaderType>
+    inline void ServerTaskHandler<HeaderType>::ProcessClientRequest(AsyncSock::ISocketCommunicator* client, ERequestType type)
     {
         // if client has written something - handle their request type
         switch (type)
@@ -121,55 +124,75 @@ namespace AsyncTask
         }
     }
 
-    template<IsHeaderType HeaderType, typename BodyType, uint8_t NumTaskThreads>
-    inline bool ServerTaskHandler<HeaderType, BodyType, NumTaskThreads>::ProcessTaskSubmition(AsyncSock::ISocketCommunicator* client)
+    template<IsTriviallyCopyable  HeaderType>
+    inline bool ServerTaskHandler<HeaderType>::ProcessTaskSubmition(AsyncSock::ISocketCommunicator* client)
     {
         HeaderType header;
         ASOCK_THROW_IF_FALSE(client->Read(header) == sizeof(HeaderType));
 
-        // we must immediately know how much bytes to read in order to correctly proceed
-        size_t numBytes = 0;
-        ASOCK_THROW_IF_FALSE(client->Read(numBytes) == sizeof(size_t));
+        // we must immediately know how much chunks to read in order to correctly proceed
+        size_t numChunks = 0;
+        ASOCK_THROW_IF_FALSE(client->Read(numChunks) == sizeof(size_t));
 
-        std::vector<uint8_t> body(numBytes);
-
-        // read until totalRead >= numBytes
-        uint32_t totalRead = 0;
-        while (totalRead < numBytes)
+        // TODO: Add reasonable limit for the chunks, not just hardcoded value
+        if (numChunks == 0 || numChunks > 256)
         {
-            uint32_t leftToRead = numBytes - totalRead;
-            uint32_t bodyBytesRead = client->Read(body.data() + totalRead, leftToRead);
-            totalRead += bodyBytesRead;
+            ASOCK_LOG("Incorrect amount of chunks is read by the server ({} chunks)\n", numChunks);
+            return false;
         }
 
-        if (totalRead != numBytes)
+        // read partitioned data by chunks here
+        std::vector<BodyChunk> chunks(numChunks);
+        for (size_t chunkIdx = 0; chunkIdx < numChunks; ++chunkIdx)
         {
-            ASOCK_LOG("Read {} bytes (instead of {})! This will ruin everything probs!\n",
-                totalRead,
-                numBytes);
+            BodyChunk& chunk = chunks[chunkIdx];
+
+            // read amount of bytes in chunk
+            uint32_t numBytesInChunk = 0;
+            ASOCK_THROW_IF_FALSE(client->Read(numBytesInChunk) == sizeof(numBytesInChunk));
+
+            chunk.resize(numBytesInChunk);
+            
+            // read until totalRead >= numBytesInChunk
+            uint32_t totalRead = 0;
+            while (totalRead < numBytesInChunk)
+            {
+                uint32_t leftToRead = numBytesInChunk - totalRead;
+                uint32_t bodyBytesRead = client->Read(chunk.data() + totalRead, leftToRead);
+                totalRead += bodyBytesRead;
+            }
+
+            if (totalRead != numBytesInChunk)
+            {
+                ASOCK_LOG("Read {} bytes for chunk (instead of {})! This will ruin everything probs!\n",
+                    totalRead,
+                    numBytesInChunk);
+            }
+
+            ASOCK_LOG("Finished reading data from chunk {}. Read {} bytes\n", chunkIdx, totalRead);
         }
 
-        ASOCK_LOG("Task Submition! Successfully received task type and header ({} bytes of data)\n", numBytes);
+        ASOCK_LOG("Task Submition! Successfully received header and task data (as {} chunks)\n", numChunks);
 
         // Submit task here
-        m_threadPool.SubmitTask([](const HeaderType& header, const std::vector<uint8_t>& body)
+        /*m_threadPool.SubmitTask([](const HeaderType& header, const std::vector<uint8_t>& body)
             {
                 const uint8_t* bytes = body.data();
                 std::cout << "Completed task! Processed " << body.size() << " bytes!\n";
-            }, header, std::move(body));
+            }, header, std::move(body));*/
         return true;
     }
 
-    template<IsHeaderType HeaderType, typename BodyType, uint8_t NumTaskThreads>
-    inline bool ServerTaskHandler<HeaderType, BodyType, NumTaskThreads>::ProcessTaskStatus(AsyncSock::ISocketCommunicator* client)
+    template<IsTriviallyCopyable  HeaderType>
+    inline bool ServerTaskHandler<HeaderType>::ProcessTaskStatus(AsyncSock::ISocketCommunicator* client)
     {
         ASOCK_THROW_IF_FALSE(client->Write(ETaskStatus::Failed) == sizeof(ETaskStatus));
         ASOCK_LOG("Task Status!\n");
         return true;
     }
     
-    template<IsHeaderType HeaderType, typename BodyType, uint8_t NumTaskThreads>
-    inline bool ServerTaskHandler<HeaderType, BodyType, NumTaskThreads>::ProcessTaskResult(AsyncSock::ISocketCommunicator* client)
+    template<IsTriviallyCopyable  HeaderType>
+    inline bool ServerTaskHandler<HeaderType>::ProcessTaskResult(AsyncSock::ISocketCommunicator* client)
     {
         ASOCK_LOG("Task Result!\n");
         return true;
