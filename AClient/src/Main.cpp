@@ -36,7 +36,7 @@ void Communicate()
     getchar();
 
     using MatrixType = Math::Matrix<uint32_t>;
-    MatrixType matrixResult = MatrixType(16); // 4x4 matrix
+    MatrixType matrixResult = MatrixType(20000); // 4x4 matrix
 
     struct MatrixTaskHeader
     {
@@ -52,31 +52,34 @@ void Communicate()
     }
 
     AsyncTask::ClientTaskHandler::BodyPartition bodyPartition = {};
+
+    // create a span for body to upload
+    const uint8_t* matrixBegin = (const uint8_t*)(matrixResult.Elements.data());
+    const uint8_t* matrixEnd   = (const uint8_t*)(matrixResult.Elements.data() + matrixResult.Elements.size());
+    bodyPartition.Body = std::span(matrixBegin, matrixEnd);
+
+    // describe chunk partitioning
     static constexpr size_t numChunks = 4; // we want 4 chunks per task
-    const size_t numWorkunitsPerChunk = matrixResult.NumCols / numChunks;
-    const size_t numLeftoverWorkunits = matrixResult.NumCols % numChunks;
+    static constexpr size_t MatrixElementStride = sizeof(MatrixType::ValueType);
+    const size_t numBytesPerChunk = (matrixResult.NumCols / numChunks) * matrixResult.NumRows * MatrixElementStride;
+    const size_t numLeftoverBytes = (matrixResult.NumCols % numChunks) * matrixResult.NumRows * MatrixElementStride;
 
     // here we partition our matrix data into chunks for server to compute in parallel
     // this can be totally avoided by just submitting one chunk of matrix data to the server - would make no difference
     for (size_t chunkIdx = 0; chunkIdx < numChunks; ++chunkIdx)
     {
-        static constexpr size_t MatrixElementStride = sizeof(MatrixType::ValueType);
-
         // each column has NumRows elements and each of them is MatrixElementStride bytes
         // thus each column is NumRows * MatrixElementStride bytes
-        size_t firstColumnIdx = numWorkunitsPerChunk * (chunkIdx);
-        size_t lastColumnIdx  = numWorkunitsPerChunk * (chunkIdx + 1);
+        size_t beginInBytes = numBytesPerChunk * (chunkIdx);
+        size_t endInBytes   = numBytesPerChunk * (chunkIdx + 1);
         
         // If last chunk is to be written - add leftover work to it
         if (chunkIdx == numChunks - 1)
-        {
-            lastColumnIdx += numLeftoverWorkunits;
-        }
+            endInBytes += numLeftoverBytes;
 
-        const size_t bytesToWrite = (lastColumnIdx - firstColumnIdx) * matrixResult.NumRows * sizeof(MatrixType::ValueType);
-        bodyPartition.push_back(AsyncTask::ClientTaskHandler::BodyChunk{
-            .NumBytes = static_cast<uint32_t>(bytesToWrite),
-            .Buffer = (AsyncTask::ClientTaskHandler::BodyChunk::ByteBuffer)matrixResult.GetColumn(firstColumnIdx),
+        bodyPartition.ExecutionChunks.push_back(AsyncTask::ClientTaskHandler::BodyChunk{
+            .NumBytes = (endInBytes - beginInBytes),
+            .BufferOffsetInBytes = beginInBytes,
         });
     }
 

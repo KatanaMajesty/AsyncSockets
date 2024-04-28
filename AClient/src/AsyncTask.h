@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <thread>
+#include <span>
 #include "AsyncSock.h"
 
 namespace AsyncTask
@@ -38,19 +39,23 @@ namespace AsyncTask
         // it stores the amount of bytes in the current chunk as well as the bytes itself
         struct BodyChunk
         {
-            using ByteBuffer = const uint8_t*;
-
             // Number of bytes for chunk of data
-            uint32_t NumBytes = 0;
+            size_t NumBytes = 0;
 
-            // chunks allow to split task execution into multiple threads
-            ByteBuffer Buffer = nullptr;
+            // Offset in bytes into global body buffer for where the chunk begins
+            size_t BufferOffsetInBytes = 0;
         };
 
         // BodyPartition struct allows to split task execution into multiple threads on server
-        // by providing N chunks of the same data server will queue N works to execute it
+        // by providing N chunks that describe body partitioning, thus server will queue N works to execute it
         // Task will only be considered Finished when all chunk tasks are executed successfully
-        using BodyPartition = std::vector<BodyChunk>;
+        struct BodyPartition
+        {
+            std::span<const uint8_t> Body;
+
+            // If data partitioning is not desired, array should be left empty, thus the body will be submitted as a whole
+            std::vector<BodyChunk> ExecutionChunks;
+        };
 
         ClientTaskHandler() = default;
 
@@ -67,7 +72,7 @@ namespace AsyncTask
         {
             static_assert(std::is_trivially_copyable_v<HeaderType>, "Header type should be trivially copyable!");
 
-            if (!m_client.IsConnected() || bodyPartition.empty())
+            if (!m_client.IsConnected())
             {
                 return false;
             }
@@ -75,17 +80,20 @@ namespace AsyncTask
             ASOCK_THROW_IF_FALSE( m_client.Write(ERequestType::TaskSubmition) == sizeof(ERequestType) );
             ASOCK_THROW_IF_FALSE( m_client.Write(header) == sizeof(HeaderType) );
 
-            // Write body partition info (number of chunks) and start partitioned data upload
-            ASOCK_THROW_IF_FALSE( m_client.Write(bodyPartition.size()) == sizeof(size_t) );
-            for (const BodyChunk& chunk: bodyPartition)
+            // Write body chunk partition info before starting to upload the data
+            ASOCK_THROW_IF_FALSE( m_client.Write(bodyPartition.ExecutionChunks.size()) == sizeof(size_t) );
+            for (const BodyChunk& chunk: bodyPartition.ExecutionChunks)
             {
                 // firstly write amount of bytes in chunk
-                ASOCK_THROW_IF_FALSE( m_client.Write(chunk.NumBytes) == sizeof(uint32_t) );
-                if (m_client.Write(chunk.Buffer, chunk.NumBytes) != chunk.NumBytes)
-                {
-                    ASOCK_LOG("Client -> Critical! Failed to upload body chunk data of size {}! Aborting...\n", chunk.NumBytes);
-                    return false;
-                }
+                ASOCK_THROW_IF_FALSE( m_client.Write(chunk) == sizeof(chunk) );
+            }
+
+            // And finally in the end write amount of body bytes and body of bytes itself
+            ASOCK_THROW_IF_FALSE( m_client.Write(bodyPartition.Body.size()) == sizeof(size_t) );
+            if (m_client.Write(bodyPartition.Body.data(), bodyPartition.Body.size()) != bodyPartition.Body.size())
+            {
+                ASOCK_LOG("Client -> Critical! Failed to upload body chunk data of size {}! Aborting...\n", bodyPartition.Body.size());
+                return false;
             }
 
             return true;

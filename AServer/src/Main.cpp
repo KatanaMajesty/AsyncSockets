@@ -1,5 +1,6 @@
 #include <cstdint>
-
+#include <cassert>
+#include <span>
 #include "AsyncTask.h"
 
 // task -> fill square matrix with random values
@@ -8,24 +9,25 @@
 namespace Math
 {
     template<typename T>
-    struct Matrix
+    struct MatrixView
     {
         using ValueType = T;
 
-        Matrix() = default;
-        Matrix(size_t dimensions)
-            : Elements(dimensions* dimensions)
-            , NumCols(dimensions)
-            , NumRows(dimensions)
+        MatrixView() = default;
+        MatrixView(T* begin, T* end, size_t numCols, size_t numRows)
+            : View(begin, end)
+            , NumCols(numCols)
+            , NumRows(numRows)
         {
+            assert(View.size() == (numCols * numRows));
         }
 
-        T& At(size_t col, size_t row) { return Elements.at(row * NumCols + col); }
-        const T& At(size_t col, size_t row) const { return Elements.at(row * NumCols + col); }
+        T& At(size_t col, size_t row) { return View[row * NumCols + col]; }
+        const T& At(size_t col, size_t row) const { return View[row * NumCols + col]; }
 
-        std::vector<T> Elements;
-        size_t NumCols = 0;
-        size_t NumRows = 0;
+        std::span<T> View;
+        const size_t NumCols = 0;
+        const size_t NumRows = 0;
     };
 }
 
@@ -40,7 +42,7 @@ int32_t main()
     ASOCK_LOG("Press any button to startup a server\n");
     getchar();
 
-    using MatrixType = Math::Matrix<uint32_t>;
+    using MatrixViewType = Math::MatrixView<uint32_t>;
 
     struct MatrixTaskHeader
     {
@@ -49,22 +51,54 @@ int32_t main()
     };
 
     AsyncTask::ServerTaskHandler<MatrixTaskHeader> serverTaskHandler;
-    serverTaskHandler.Init(std::thread::hardware_concurrency(), [](MatrixTaskHeader header, AsyncTask::TaskChunkContext* chunkContext)
+    serverTaskHandler.Init(std::thread::hardware_concurrency(), 
+        [](MatrixTaskHeader header, AsyncTask::TaskContext* taskContext, size_t chunkID)
         {
-            const AsyncSock::ISocketCommunicator::AddressInfo& addressInfo = chunkContext->Client->GetAddressInfo();
-            ASOCK_LOG("[Chunk{}:{}] -> Starting chunk for client\n", chunkContext->ChunkID, addressInfo.Port);
-            ASOCK_LOG("[Chunk{}:{}] -> Working on a chunk for {}x{} matrix\n", chunkContext->ChunkID, addressInfo.Port, header.NumCols, header.NumRows);
-            ASOCK_LOG("[Chunk{}:{}] -> Received {} bytes in total for current chunk\n", chunkContext->ChunkID, addressInfo.Port, chunkContext->Body.size());
+            const AsyncSock::ISocketCommunicator::AddressInfo& addressInfo = taskContext->Client->GetAddressInfo();
+            AsyncTask::ExecutionChunk* executionChunk = taskContext->GetExecutionChunk(chunkID);
+            ASOCK_LOG("[Chunk{}:{}] -> Starting chunk for client\n", chunkID, addressInfo.Port);
+            ASOCK_LOG("[Chunk{}:{}] -> Working on a chunk for {}x{} matrix\n", chunkID, addressInfo.Port, header.NumCols, header.NumRows);
+            ASOCK_LOG("[Chunk{}:{}] -> Received {} bytes in total for current chunk\n", chunkID, addressInfo.Port, executionChunk->Chunk.NumBytes);
+            
+            // we should always block chunk mutex to synchronize with task handler's packet handling
+            std::unique_lock _(executionChunk->ChunkMutex);
 
-            // we need to lock mutex in order to be sure that the client request to receive data would not copy bytes while we write
-            std::unique_lock _(chunkContext->BodyMutex);
+            const AsyncTask::BodyChunk& chunk = executionChunk->Chunk;
 
             // now we can start reinterpreting bytes and begin calculations
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            static constexpr size_t MatrixElementStride = sizeof(MatrixViewType::ValueType);
+            const size_t chunkNumElements = chunk.NumBytes / MatrixElementStride;
+            const size_t chunkNumColumns  = chunkNumElements / header.NumRows;
+            // local sanity checks
+            assert(chunk.NumBytes % MatrixElementStride == 0);
+            assert(chunkNumElements % header.NumRows == 0);
+
+            // calculate column offset of the current chunk respectively to the whole matrix body
+            const size_t taskElementOffset  = chunk.BufferOffsetInBytes / MatrixElementStride;
+            const size_t taskColumnOffset   = taskElementOffset / header.NumRows;
+            // task sanity-checks
+            assert(chunk.BufferOffsetInBytes % MatrixElementStride == 0);
+            assert(taskElementOffset % header.NumRows == 0);
+
+            MatrixViewType::ValueType* begin  = (MatrixViewType::ValueType*)(taskContext->Body.data());
+            MatrixViewType::ValueType* end    = (MatrixViewType::ValueType*)(taskContext->Body.data() + taskContext->Body.size());
+            MatrixViewType matrixView(begin, end, header.NumCols, header.NumRows);
+        
+            for (size_t localColIdx = 0; localColIdx < chunkNumColumns; ++localColIdx)
+            {
+                const size_t columnIndex = localColIdx + taskColumnOffset;
+
+                MatrixViewType::ValueType localMax = std::numeric_limits<MatrixViewType::ValueType>::min();
+                for (std::size_t rowIndex = 0; rowIndex < matrixView.NumRows; ++rowIndex)
+                {
+                    localMax = std::max(localMax, matrixView.At(columnIndex, rowIndex));
+                }
+                matrixView.At(columnIndex, columnIndex) = localMax;
+            }
 
             // mark chunk as done
-            ASOCK_LOG("[Chunk{}:{}] -> Done!\n", chunkContext->ChunkID, addressInfo.Port);
-            chunkContext->State = AsyncTask::EChunkState::Done;
+            ASOCK_LOG("[Chunk{}:{}] -> Done!\n", chunkID, addressInfo.Port);
+            executionChunk->State = AsyncTask::EChunkState::Done;
         });
     serverTaskHandler.Wait();
 

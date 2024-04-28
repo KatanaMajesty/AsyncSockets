@@ -39,33 +39,55 @@ namespace AsyncTask
         TaskStatus,
         TaskResult,
     };
-    
-    struct TaskChunkContext
+
+    // BodyChunk is solely for internal use but is also available as a part of public API
+    // it stores the amount of bytes in the current chunk as well as the bytes itself
+    struct BodyChunk
     {
-        static_assert(std::atomic<ETaskStatus>::is_always_lock_free);
+        // Number of bytes for chunk of data
+        size_t NumBytes = 0;
+
+        // Offset in bytes into global body buffer for where the chunk begins
+        size_t BufferOffsetInBytes = 0;
+    };
+
+    struct ExecutionChunk
+    {
+        static_assert(std::atomic<EChunkState>::is_always_lock_free);
+
+        size_t ChunkID = size_t(-1);
+        std::atomic<EChunkState> State = EChunkState::Invalid;
+
+        // chunk mutex is required for client/server synchronization
+        // when chunk task is being executed, ChunkMutex must be acquired thus the client would not be able
+        // to retrieve task result without it being complete
+        mutable std::mutex ChunkMutex;
+        BodyChunk Chunk;
+    };
+    
+    struct TaskContext
+    {
+        ExecutionChunk* GetExecutionChunk(size_t chunkID) const { return ExecutionChunks.at(chunkID).get(); }
 
         // Accessing const data of ISocketCommunicator is generally thread-safe, although not guaranteed to be
         const AsyncSock::ISocketCommunicator* Client = nullptr;
-        uint32_t ChunkID = uint32_t(-1);
 
-        mutable std::mutex BodyMutex;
+        mutable std::mutex   BodyMutex;
         std::vector<uint8_t> Body;
-        std::atomic<EChunkState> State = EChunkState::Invalid;
+        std::vector<std::unique_ptr<ExecutionChunk>> ExecutionChunks;
     };
 
     // just a wrapper over unordered_map of tasks
     class ClientTaskMap
     {
     public:
-        TaskChunkContext* AddChunkContext(SOCKET socket);
-    
-        bool HasChunkContexts(SOCKET socket) const;
-        auto& GetAllChunkContexts(SOCKET socket) { return m_contextMap.at(socket); }
-        auto& GetAllChunkContexts(SOCKET socket) const { return m_contextMap.at(socket); }
-
+        bool HasTaskContext(SOCKET socket) const;
+        TaskContext* AddTaskContext(SOCKET socket);
+        TaskContext* GetTaskContext(SOCKET socket) const { return m_contextMap.at(socket).get(); }
+        
     private:
         // to handle tasks easier, it is just a SOCKET key
-        std::unordered_map<SOCKET, std::vector<std::unique_ptr<TaskChunkContext>>> m_contextMap;
+        std::unordered_map<SOCKET, std::unique_ptr<TaskContext>> m_contextMap;
     };
 
     template<typename T>
@@ -80,7 +102,7 @@ namespace AsyncTask
         // Generally, if a task is completed, chunk's state should have a value of EChunkState::Done
         // But if critical error occured or termination was requested EChunkState::Aborted should be assigned, although it is not required
         // for more info see EChunkState ennum class
-        using TaskDelegate = std::function<void(HeaderType header, TaskChunkContext* chunkContext)>;
+        using TaskDelegate = std::function<void(HeaderType header, TaskContext* taskContext, size_t chunkID)>;
 
         ServerTaskHandler() = default;
         
@@ -98,10 +120,6 @@ namespace AsyncTask
         }
 
     private:
-        // BodyChunk is solely for internal use (unlike one the Client side of the API)
-        // Also quite differs from the client side, as it is basically just an array of bytes
-        using BodyChunk = std::vector<uint8_t>;
-
         void UpdateClients();
         void ProcessClientRequest(AsyncSock::ISocketCommunicator* client, ERequestType type);
         bool ProcessTaskSubmition(AsyncSock::ISocketCommunicator* client);
@@ -180,78 +198,76 @@ namespace AsyncTask
     {
         // First of all check if client already has any tasks on the server
         // if so - just ignore packets. No support for different tasks from one client
-        bool bIgnorePackets = m_clientTaskMap.HasChunkContexts(client->GetSocket());
+        const AsyncSock::ISocketCommunicator::AddressInfo& addressInfo = client->GetAddressInfo();
+        if (m_clientTaskMap.HasTaskContext(client->GetSocket()))
+        {
+            ASOCK_LOG("Client {}:{} already has a task in progress!\n", addressInfo.IPv4, addressInfo.Port);
+            return false;
+        }
 
         HeaderType header;
         ASOCK_THROW_IF_FALSE(client->Read(header) == sizeof(HeaderType));
 
         // we must immediately know how much chunks to read in order to correctly proceed
-        size_t numChunks = 0;
-        ASOCK_THROW_IF_FALSE(client->Read(numChunks) == sizeof(size_t));
+        size_t numExecutionChunks = 0;
+        ASOCK_THROW_IF_FALSE(client->Read(numExecutionChunks) == sizeof(size_t));
 
         // TODO: Add reasonable limit for the chunks, not just hardcoded value
-        if (numChunks == 0 || numChunks > 256)
+        // TODO: Also chunks might be empty and zero should become acceptable
+        if (numExecutionChunks == 0 || numExecutionChunks > 256)
         {
-            ASOCK_LOG("Incorrect amount of chunks is read by the server ({} chunks)\n", numChunks);
+            ASOCK_LOG("Incorrect amount of chunks is read by the server ({} chunks)\n", numExecutionChunks);
             return false;
         }
 
-        // read partitioned data by chunks here
-        std::vector<BodyChunk> chunks(numChunks);
-        for (size_t chunkIdx = 0; chunkIdx < numChunks; ++chunkIdx)
+        // create and fill basic data for task context
+        TaskContext* taskContext = m_clientTaskMap.AddTaskContext(client->GetSocket());
+        taskContext->Client = client;
+
+        // now read chunk information!
+        taskContext->ExecutionChunks.resize(numExecutionChunks);
+        for (size_t i = 0; i < numExecutionChunks; ++i)
         {
-            BodyChunk& chunk = chunks[chunkIdx];
+            taskContext->ExecutionChunks[i] = std::make_unique<ExecutionChunk>();
 
-            // read amount of bytes in chunk
-            uint32_t numBytesInChunk = 0;
-            ASOCK_THROW_IF_FALSE(client->Read(numBytesInChunk) == sizeof(numBytesInChunk));
+            ExecutionChunk* executionChunk = taskContext->GetExecutionChunk(i);
+            executionChunk->ChunkID = i;
+            executionChunk->State = EChunkState::InProgress;
 
-            chunk.resize(numBytesInChunk);
-            
-            // read until totalRead >= numBytesInChunk
-            uint32_t totalRead = 0;
-            while (totalRead < numBytesInChunk)
-            {
-                uint32_t leftToRead = numBytesInChunk - totalRead;
-                uint32_t bodyBytesRead = client->Read(chunk.data() + totalRead, leftToRead);
-                totalRead += bodyBytesRead;
-            }
-
-            if (totalRead != numBytesInChunk)
-            {
-                ASOCK_LOG("Read {} bytes for chunk (instead of {})! This will ruin everything probs!\n",
-                    totalRead,
-                    numBytesInChunk);
-            }
-
-            ASOCK_LOG("Finished reading data from chunk {}. Read {} bytes\n", chunkIdx, totalRead);
+            BodyChunk& bodyChunk = executionChunk->Chunk;
+            ASOCK_THROW_IF_FALSE(client->Read(bodyChunk) == sizeof(bodyChunk));
         }
 
-        // if we ignore packets, bail out here
-        if (bIgnorePackets)
+        // finally we can read global body data
+        // read until totalRead >= numBytes
+        size_t numBytes = 0;
+        ASOCK_THROW_IF_FALSE(client->Read(numBytes) == sizeof(numBytes) && numBytes > 0);
+
+        // resize body to numBytes
+        taskContext->Body.resize(numBytes);
+
+        size_t totalRead = 0;
+        while (totalRead < numBytes)
         {
-            ASOCK_LOG("Client has already submitted tasks before, could not add a new one. Aborting...\n");
-            return false;
+            size_t bytesLeft = numBytes - totalRead;
+            size_t bytesRead = client->Read(taskContext->Body.data() + totalRead, bytesLeft);
+            totalRead += bytesRead;
         }
 
-        ASOCK_LOG("Task Submition! Successfully received header and task data (as {} chunks)\n", numChunks);
-
-        // Now for each chunk add new TaskChunkContext and submit a task to the thread pool
-        for (uint32_t i = 0; i < chunks.size(); ++i)
+        if (totalRead != numBytes)
         {
-            BodyChunk& chunk = chunks[i];
-
-            TaskChunkContext* chunkContext = m_clientTaskMap.AddChunkContext(client->GetSocket());
-            ASOCK_THROW_IF_FALSE(chunkContext != nullptr);
-
-            chunkContext->Client = client;
-            chunkContext->ChunkID = i;
-            chunkContext->Body = std::move(chunk);
-            chunkContext->State = EChunkState::InProgress;
-
-            ASOCK_THROW_IF_FALSE(m_taskDelegate != nullptr);
-            m_workerThreadPool->SubmitTask(m_taskDelegate, header, chunkContext);
+            ASOCK_LOG("Read {} bytes of body (instead of {})! This will ruin everything probs!\n",
+                totalRead,
+                numBytes);
         }
+
+        // finally submit tasks to the thread pool
+        for (size_t i = 0; i < numExecutionChunks; ++i)
+        {
+            m_workerThreadPool->SubmitTask(m_taskDelegate, header, taskContext, i);
+        }
+
+        ASOCK_LOG("Task Submition successful! Successfully received body data from {}:{} (total of {} bytes)\n", addressInfo.IPv4, addressInfo.Port, totalRead);
         return true;
     }
 
@@ -259,15 +275,18 @@ namespace AsyncTask
     inline bool ServerTaskHandler<HeaderType>::ProcessTaskStatus(AsyncSock::ISocketCommunicator* client)
     {
         SOCKET socket = client->GetSocket();
-        if (!m_clientTaskMap.HasChunkContexts(socket))
+        if (!m_clientTaskMap.HasTaskContext(socket))
         {
             ASOCK_THROW_IF_FALSE(client->Write(ETaskStatus::NotFound) == sizeof(ETaskStatus));
             return true;
         }
 
-        for (const auto& context : m_clientTaskMap.GetAllChunkContexts(socket))
+        // TODO: Handle zero chunks here as well. If no chunks are provided, whole data should be checked
+
+        TaskContext* taskContext = m_clientTaskMap.GetTaskContext(socket);
+        for (const auto& executionChunk : taskContext->ExecutionChunks)
         {
-            EChunkState chunkState = context->State.load();
+            EChunkState chunkState = executionChunk->State.load();
             switch (chunkState)
             {
             case EChunkState::InProgress: 
@@ -294,25 +313,24 @@ namespace AsyncTask
     {
         // In ProcessTaskResult we assume that task chunk contexts are already on the server (there are at least 1)
         SOCKET sock = client->GetSocket();
+        TaskContext* taskContext = m_clientTaskMap.GetTaskContext(sock);
 
         // firstly count amount of bytes to send
-        size_t totalNumBytes = 0;
-        for (const auto& context : m_clientTaskMap.GetAllChunkContexts(sock))
-        {
-            totalNumBytes += context->Body.size();
-        }
+        size_t totalNumBytes = taskContext->Body.size();
         ASOCK_THROW_IF_FALSE(client->Write(totalNumBytes) == sizeof(totalNumBytes));
 
-        // copy bytes from chunks into a single range
+        // instead of using body and bodymutex we should separately send bytes to the client for each chunk
+        // This is needed in order to avoid blocking task execution here and allow for task parallelism
         std::vector<uint8_t> bytes(totalNumBytes);
-        auto it = bytes.begin();
-        for (const auto& context : m_clientTaskMap.GetAllChunkContexts(sock))
+        for (const auto& executionChunk : taskContext->ExecutionChunks)
         {
-            std::unique_lock _(context->BodyMutex);
+            std::unique_lock _(executionChunk->ChunkMutex);
 
-            // copy and advance
-            std::ranges::copy(context->Body, it);
-            std::advance(it, context->Body.size());
+            const BodyChunk& chunk = executionChunk->Chunk;
+            auto begin  = std::next(taskContext->Body.begin(), chunk.BufferOffsetInBytes);
+            auto end    = std::next(begin, chunk.NumBytes);
+            auto dest   = std::next(bytes.begin(), chunk.BufferOffsetInBytes);
+            std::copy(begin, end, dest);
         }
 
         // write until totalWritten >= totalNumBytes

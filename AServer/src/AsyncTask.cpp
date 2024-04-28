@@ -3,7 +3,7 @@
 namespace AsyncTask
 {
 
-    TaskChunkContext* ClientTaskMap::AddChunkContext(SOCKET socket)
+    TaskContext* ClientTaskMap::AddTaskContext(SOCKET socket)
     {
         if (socket == AsyncSock::InvalidSocket)
         {
@@ -11,11 +11,16 @@ namespace AsyncTask
             return nullptr;
         }
 
-        auto& context = m_contextMap[socket].emplace_back(new TaskChunkContext());
-        return context.get();
+        if (HasTaskContext(socket))
+        {
+            return nullptr;
+        }
+
+        m_contextMap[socket] = std::make_unique<TaskContext>();
+        return m_contextMap[socket].get();
     }
 
-    bool ClientTaskMap::HasChunkContexts(SOCKET socket) const
+    bool ClientTaskMap::HasTaskContext(SOCKET socket) const
     {
         return (m_contextMap.find(socket) != m_contextMap.end());
     }
