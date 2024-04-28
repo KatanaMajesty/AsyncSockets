@@ -71,11 +71,13 @@ namespace AsyncSock
         // if listener is ready to accept new connections - do so
         if (listenerPollfd.revents & POLLRDNORM)
         {
-            ClientCommunicator*  pCommunicator = (ClientCommunicator*)Accept();
+            ISocketCommunicator* pCommunicator = Accept();
             ASOCK_THROW_IF_FALSE(pCommunicator != nullptr);
+
+            const ISocketCommunicator::AddressInfo& addressInfo = pCommunicator->GetAddressInfo();
             ASOCK_LOG("Accepted a new communicator at {}:{}!\n", 
-                pCommunicator->GetAddressIPv4(), 
-                pCommunicator->GetAddressPort());
+                addressInfo.IPv4,
+                addressInfo.Port);
         }
 
         // iterate over all the clients and add them to the m_clientRwPollfds array 
@@ -185,8 +187,10 @@ namespace AsyncSock
     }
 
     ClientCommunicator::ClientCommunicator(SOCKET client, const std::string& ipv4, uint16_t port)
-        : m_addressIPv4(ipv4)
-        , m_addressPort(port)
+        : m_addressInfo(ISocketCommunicator::AddressInfo{
+                .IPv4 = ipv4,
+                .Port = port
+            })
         , m_client(client)
     {
         if (m_client == AsyncSock::InvalidSocket)

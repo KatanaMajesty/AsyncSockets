@@ -14,9 +14,9 @@ namespace AsyncTask
     enum class ETaskStatus : uint8_t
     {
         Unknown = 0, // was not able to retrieve status
+        Submitted,
         Finished,   // able to retrieve result
-        Failed,     // task is failed
-        Terminated, // task is terminated, no result submitted
+        Failed,     // task is failed, could basically occur on Termination
         NotFound,   // no task is found on the server
     };
 
@@ -27,6 +27,34 @@ namespace AsyncTask
         TaskStatus,
         TaskResult,
     };
+    
+    struct TaskChunkContext
+    {
+        static_assert(std::atomic<ETaskStatus>::is_always_lock_free);
+
+        // Accessing const data of ISocketCommunicator is generally thread-safe, although not guaranteed to be
+        const AsyncSock::ISocketCommunicator* Client = nullptr;
+        uint32_t ChunkID = uint32_t(-1);
+
+        mutable std::mutex BodyMutex;
+        std::vector<uint8_t> Body;
+        std::atomic<ETaskStatus> Status = ETaskStatus::Unknown;
+    };
+
+    // just a wrapper over unordered_map of tasks
+    class ClientTaskMap
+    {
+    public:
+        TaskChunkContext* AddChunkContext(SOCKET socket);
+    
+        bool HasChunkContexts(SOCKET socket) const;
+        auto& GetAllChunkContexts(SOCKET socket) { return m_contextMap.at(socket); }
+        auto& GetAllChunkContexts(SOCKET socket) const { return m_contextMap.at(socket); }
+
+    private:
+        // to handle tasks easier, it is just a SOCKET key
+        std::unordered_map<SOCKET, std::vector<std::unique_ptr<TaskChunkContext>>> m_contextMap;
+    };
 
     template<typename T>
     concept IsTriviallyCopyable = std::is_trivially_copyable_v<T>;
@@ -35,7 +63,7 @@ namespace AsyncTask
     class ServerTaskHandler
     {
     public:
-        using TaskFunctor = std::function<void(const HeaderType& header, const std::vector<uint8_t>& body)>;
+        using TaskDelegate = std::function<void(HeaderType header, TaskChunkContext* chunkContext)>;
 
         ServerTaskHandler() = default;
         
@@ -45,7 +73,7 @@ namespace AsyncTask
             m_workerThreadPool->Terminate();
         }
 
-        void Init(uint32_t numWorkerThreads);
+        void Init(uint32_t numWorkerThreads, const TaskDelegate& taskDelegate);
         void Wait()
         {
             if (m_clientThread.joinable())
@@ -65,13 +93,17 @@ namespace AsyncTask
 
         AsyncSock::Server m_server;
         std::thread m_clientThread;
+
+        TaskDelegate m_taskDelegate = nullptr;
         std::unique_ptr<ThreadPool> m_workerThreadPool;
+
+        ClientTaskMap m_clientTaskMap;
     };
 
     template<IsTriviallyCopyable  HeaderType>
-    inline void ServerTaskHandler<HeaderType>::Init(uint32_t numWorkerThreads)
+    inline void ServerTaskHandler<HeaderType>::Init(uint32_t numWorkerThreads, const TaskDelegate& taskDelegate)
     {
-        if (!m_server.Init(AsyncSock::BindInfo{}))
+        if (!m_server.Init(AsyncSock::BindInfo{}) || !taskDelegate)
         {
             ASOCK_LOG("Failed to init server!\n");
             return;
@@ -82,6 +114,8 @@ namespace AsyncTask
             m_server.GetBindInfo().AddressPort);
 
         m_clientThread = std::thread(&ServerTaskHandler::UpdateClients, this);
+
+        m_taskDelegate = taskDelegate;
         m_workerThreadPool = std::make_unique<ThreadPool>(numWorkerThreads);
     }
 
@@ -127,6 +161,10 @@ namespace AsyncTask
     template<IsTriviallyCopyable  HeaderType>
     inline bool ServerTaskHandler<HeaderType>::ProcessTaskSubmition(AsyncSock::ISocketCommunicator* client)
     {
+        // First of all check if client already has any tasks on the server
+        // if so - just ignore packets. No support for different tasks from one client
+        bool bIgnorePackets = m_clientTaskMap.HasChunkContexts(client->GetSocket());
+
         HeaderType header;
         ASOCK_THROW_IF_FALSE(client->Read(header) == sizeof(HeaderType));
 
@@ -172,14 +210,32 @@ namespace AsyncTask
             ASOCK_LOG("Finished reading data from chunk {}. Read {} bytes\n", chunkIdx, totalRead);
         }
 
+        // if we ignore packets, bail out here
+        if (bIgnorePackets)
+        {
+            ASOCK_LOG("Client has already submitted tasks before, could not add a new one. Aborting...\n");
+            return false;
+        }
+
         ASOCK_LOG("Task Submition! Successfully received header and task data (as {} chunks)\n", numChunks);
 
-        // Submit task here
-        /*m_threadPool.SubmitTask([](const HeaderType& header, const std::vector<uint8_t>& body)
-            {
-                const uint8_t* bytes = body.data();
-                std::cout << "Completed task! Processed " << body.size() << " bytes!\n";
-            }, header, std::move(body));*/
+        // Now for each chunk add new TaskChunkContext and submit a task to the thread pool
+        for (uint32_t i = 0; i < chunks.size(); ++i)
+        {
+            BodyChunk& chunk = chunks[i];
+
+            TaskChunkContext* chunkContext = m_clientTaskMap.AddChunkContext(client->GetSocket());
+            ASOCK_THROW_IF_FALSE(chunkContext != nullptr);
+
+            chunkContext->Client = client;
+            chunkContext->ChunkID = i;
+            chunkContext->Body = std::move(chunk);
+            chunkContext->Status = ETaskStatus::Submitted;
+
+            ASOCK_THROW_IF_FALSE(m_taskDelegate != nullptr);
+            m_workerThreadPool->SubmitTask(m_taskDelegate, header, chunkContext);
+        }
+
         return true;
     }
 

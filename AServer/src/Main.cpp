@@ -49,7 +49,16 @@ int32_t main()
     };
 
     AsyncTask::ServerTaskHandler<MatrixTaskHeader> serverTaskHandler;
-    serverTaskHandler.Init(std::thread::hardware_concurrency());
+    serverTaskHandler.Init(std::thread::hardware_concurrency(), [](MatrixTaskHeader header, AsyncTask::TaskChunkContext* chunkContext)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            // no need to use mutex as we are use that we will not be accessing the same data from multiple worker threads
+            // as well as we won't be changing amount of bytes in array from other threads
+            const AsyncSock::ISocketCommunicator::AddressInfo& addressInfo = chunkContext->Client->GetAddressInfo();
+            ASOCK_LOG("[Chunk{}] -> Starting chunk for client with address {}:{}\n", chunkContext->ChunkID, addressInfo.IPv4, addressInfo.Port);
+            ASOCK_LOG("[Chunk{}] -> Working on a chunk for {}x{} matrix\n", chunkContext->ChunkID, header.NumCols, header.NumRows);
+            ASOCK_LOG("[Chunk{}] -> Received {} bytes in total for current chunk\n", chunkContext->ChunkID, chunkContext->Body.size());
+        });
     serverTaskHandler.Wait();
 
     AsyncSock::Cleanup();

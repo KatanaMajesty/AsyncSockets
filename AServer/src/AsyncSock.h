@@ -60,11 +60,21 @@ namespace AsyncSock
     class ISocketCommunicator
     {
     public:
+        struct AddressInfo
+        {
+            std::string IPv4;
+            uint16_t    Port;
+        };
+
         ISocketCommunicator() = default;
         virtual ~ISocketCommunicator() = default;
 
+        virtual SOCKET GetSocket() const = 0;
+
         virtual uint32_t Read(void* dst, size_t numBytes) = 0;
         virtual uint32_t Write(const void* src, size_t numBytes) = 0;
+
+        virtual const AddressInfo& GetAddressInfo() const = 0;
 
         template<typename T> uint32_t Read(T& t) { return Read(&t, sizeof(T)); }
         template<typename T> uint32_t Write(T&& t) { return Write(&t, sizeof(T)); }
@@ -77,17 +87,17 @@ namespace AsyncSock
         ClientCommunicator(SOCKET client, const std::string& ipv4, uint16_t port);
         virtual ~ClientCommunicator();
 
+        SOCKET GetSocket() const override { return m_client; }
+
         uint32_t Read(void* dest, size_t numBytes) override;
         uint32_t Write(const void* src, size_t numBytes) override;
 
-        const std::string& GetAddressIPv4() const { return m_addressIPv4; }
-        uint16_t GetAddressPort() const { return m_addressPort; }
+        const AddressInfo& GetAddressInfo() const override { return m_addressInfo; }
 
     private:
         friend class Server;
 
-        std::string m_addressIPv4;
-        uint16_t    m_addressPort;
+        AddressInfo m_addressInfo;
         SOCKET m_client = AsyncSock::InvalidSocket;
     };
 

@@ -4,6 +4,7 @@ project(AsyncServer LANGUAGES CXX)
 set(SERVER_SRC_FILES
     "src/AsyncSock.cpp"
     "src/AsyncSock.h"
+    "src/AsyncTask.cpp"
     "src/AsyncTask.h"
     "src/Main.cpp"
 )
