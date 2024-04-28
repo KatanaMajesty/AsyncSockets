@@ -56,8 +56,8 @@ void Communicate()
     const size_t numWorkunitsPerChunk = matrixResult.NumCols / numChunks;
     const size_t numLeftoverWorkunits = matrixResult.NumCols % numChunks;
 
-    // here we partition our data into chunks for server to compute in parallel
-    // this can be totally avoided by just submitting one chunk of data to the server - would make no difference
+    // here we partition our matrix data into chunks for server to compute in parallel
+    // this can be totally avoided by just submitting one chunk of matrix data to the server - would make no difference
     for (size_t chunkIdx = 0; chunkIdx < numChunks; ++chunkIdx)
     {
         static constexpr size_t MatrixElementStride = sizeof(MatrixType::ValueType);
@@ -85,9 +85,34 @@ void Communicate()
         .NumRows = matrixResult.NumRows,
     };
     clientTaskHandler.SubmitTask(header, bodyPartition);
+    
+    // Not the best and safest way to wait for task to be finished
+    // simply just loop while task is in progress or in unknown state (state of submission)
+    std::vector<uint8_t> bytes;
+    AsyncTask::ETaskStatus status = AsyncTask::ETaskStatus::Unknown;
+    do
+    {
+        status = clientTaskHandler.GetTaskResult(bytes);
+        if (status == AsyncTask::ETaskStatus::Failed)
+        {
+            ASOCK_LOG("Failed to execute task on server!\n");
+            break;
+        }
 
-    AsyncTask::ETaskStatus status = clientTaskHandler.GetTaskStatus();
-    ASOCK_LOG("Status is {}\n", static_cast<uint8_t>(status));
+        ASOCK_LOG("Task is still in progress! Waiting a bit...\n");
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    while (status == AsyncTask::ETaskStatus::InProgress || status == AsyncTask::ETaskStatus::Unknown);
+
+    if (status == AsyncTask::ETaskStatus::Finished)
+    {
+        ASOCK_LOG("Task is successfully finished on the server!\n");
+        ASOCK_LOG("Received {} bytes from the server!\n", bytes.size());
+    }
+    else
+    {
+        ASOCK_LOG("Failed to execute task on server!\n");
+    }
 
     ASOCK_LOG("Press any button to finish client execution!\n");
     getchar();

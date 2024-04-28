@@ -51,13 +51,20 @@ int32_t main()
     AsyncTask::ServerTaskHandler<MatrixTaskHeader> serverTaskHandler;
     serverTaskHandler.Init(std::thread::hardware_concurrency(), [](MatrixTaskHeader header, AsyncTask::TaskChunkContext* chunkContext)
         {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            // no need to use mutex as we are use that we will not be accessing the same data from multiple worker threads
-            // as well as we won't be changing amount of bytes in array from other threads
             const AsyncSock::ISocketCommunicator::AddressInfo& addressInfo = chunkContext->Client->GetAddressInfo();
-            ASOCK_LOG("[Chunk{}] -> Starting chunk for client with address {}:{}\n", chunkContext->ChunkID, addressInfo.IPv4, addressInfo.Port);
-            ASOCK_LOG("[Chunk{}] -> Working on a chunk for {}x{} matrix\n", chunkContext->ChunkID, header.NumCols, header.NumRows);
-            ASOCK_LOG("[Chunk{}] -> Received {} bytes in total for current chunk\n", chunkContext->ChunkID, chunkContext->Body.size());
+            ASOCK_LOG("[Chunk{}:{}] -> Starting chunk for client\n", chunkContext->ChunkID, addressInfo.Port);
+            ASOCK_LOG("[Chunk{}:{}] -> Working on a chunk for {}x{} matrix\n", chunkContext->ChunkID, addressInfo.Port, header.NumCols, header.NumRows);
+            ASOCK_LOG("[Chunk{}:{}] -> Received {} bytes in total for current chunk\n", chunkContext->ChunkID, addressInfo.Port, chunkContext->Body.size());
+
+            // we need to lock mutex in order to be sure that the client request to receive data would not copy bytes while we write
+            std::unique_lock _(chunkContext->BodyMutex);
+
+            // now we can start reinterpreting bytes and begin calculations
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            // mark chunk as done
+            ASOCK_LOG("[Chunk{}:{}] -> Done!\n", chunkContext->ChunkID, addressInfo.Port);
+            chunkContext->State = AsyncTask::EChunkState::Done;
         });
     serverTaskHandler.Wait();
 

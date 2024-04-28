@@ -17,9 +17,9 @@ namespace AsyncTask
     enum class ETaskStatus : uint8_t
     {
         Unknown = 0, // was not able to retrieve status
+        InProgress,
         Finished,   // able to retrieve result
-        Failed,     // task is failed
-        Terminated, // task is terminated, no result submitted
+        Failed,     // task is failed, could basically occur on Termination
         NotFound,   // no task is found on the server
     };
 
@@ -91,7 +91,15 @@ namespace AsyncTask
             return true;
         }
 
+        // Queries task status. If task is done on the server and can be retrieved returns ETaskStatus::Finished
+        // otherwise returns respective result thus the client can make some decisions regarding their communication with server
         ETaskStatus GetTaskStatus();
+
+        // Queries task result. If ClientTaskHandler::GetTaskStatus return value is not ETaskStatus::Finished
+        // no result is written and ETaskStatus from the server is queried (and returned)
+        // otherwise tries to read a result from server as a single body of data without chunk partitioning applied
+        // Also, if body of bytes could not be read correctly from server, returns ETaskStatus::Failed and stops querying
+        ETaskStatus GetTaskResult(std::vector<uint8_t>& bytes);
 
     private:
         bool InternalConnect(const AsyncSock::ConnectionInfo& connectionInfo);

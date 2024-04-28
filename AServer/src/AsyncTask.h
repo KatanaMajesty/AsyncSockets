@@ -14,10 +14,22 @@ namespace AsyncTask
     enum class ETaskStatus : uint8_t
     {
         Unknown = 0, // was not able to retrieve status
-        Submitted,
+        InProgress,
         Finished,   // able to retrieve result
         Failed,     // task is failed, could basically occur on Termination
         NotFound,   // no task is found on the server
+    };
+
+    // Chunk state describes the state of task chunk context
+    // It is used by the ServerTaskHandler to determine whether or not particular part of a task was done
+    // If all chunk partitions of a task are marked as EChunkState::Done the task is considered ETaskStatus::Finished
+    // Although, if at least one chunk is marked as EChunkState::Aborted or EChunkState::Invalid - task is considered failed
+    enum class EChunkState : uint8_t
+    {
+        Invalid = 0,
+        InProgress = 1,
+        Done = 2,
+        Aborted = 3,
     };
 
     enum class ERequestType : uint8_t
@@ -38,7 +50,7 @@ namespace AsyncTask
 
         mutable std::mutex BodyMutex;
         std::vector<uint8_t> Body;
-        std::atomic<ETaskStatus> Status = ETaskStatus::Unknown;
+        std::atomic<EChunkState> State = EChunkState::Invalid;
     };
 
     // just a wrapper over unordered_map of tasks
@@ -63,6 +75,11 @@ namespace AsyncTask
     class ServerTaskHandler
     {
     public:
+        // When task delegate is invoked with a new chunk context, latter's chunk state is set to "InProgress"
+        // It is user's responsibility to assign correct chunk state on the task completion
+        // Generally, if a task is completed, chunk's state should have a value of EChunkState::Done
+        // But if critical error occured or termination was requested EChunkState::Aborted should be assigned, although it is not required
+        // for more info see EChunkState ennum class
         using TaskDelegate = std::function<void(HeaderType header, TaskChunkContext* chunkContext)>;
 
         ServerTaskHandler() = default;
@@ -230,27 +247,93 @@ namespace AsyncTask
             chunkContext->Client = client;
             chunkContext->ChunkID = i;
             chunkContext->Body = std::move(chunk);
-            chunkContext->Status = ETaskStatus::Submitted;
+            chunkContext->State = EChunkState::InProgress;
 
             ASOCK_THROW_IF_FALSE(m_taskDelegate != nullptr);
             m_workerThreadPool->SubmitTask(m_taskDelegate, header, chunkContext);
         }
-
         return true;
     }
 
     template<IsTriviallyCopyable  HeaderType>
     inline bool ServerTaskHandler<HeaderType>::ProcessTaskStatus(AsyncSock::ISocketCommunicator* client)
     {
-        ASOCK_THROW_IF_FALSE(client->Write(ETaskStatus::Failed) == sizeof(ETaskStatus));
-        ASOCK_LOG("Task Status!\n");
+        SOCKET socket = client->GetSocket();
+        if (!m_clientTaskMap.HasChunkContexts(socket))
+        {
+            ASOCK_THROW_IF_FALSE(client->Write(ETaskStatus::NotFound) == sizeof(ETaskStatus));
+            return true;
+        }
+
+        for (const auto& context : m_clientTaskMap.GetAllChunkContexts(socket))
+        {
+            EChunkState chunkState = context->State.load();
+            switch (chunkState)
+            {
+            case EChunkState::InProgress: 
+                ASOCK_THROW_IF_FALSE(client->Write(ETaskStatus::InProgress) == sizeof(ETaskStatus)); 
+                return true;
+            case EChunkState::Aborted:
+                ASOCK_THROW_IF_FALSE(client->Write(ETaskStatus::Failed) == sizeof(ETaskStatus));
+                return true;
+            case EChunkState::Invalid:
+                ASOCK_THROW_IF_FALSE(client->Write(ETaskStatus::NotFound) == sizeof(ETaskStatus));
+                return true;
+            case EChunkState::Done:
+            default: continue;
+            }
+        }
+
+        // If we still have not aborted, then all chunk states are done
+        ASOCK_THROW_IF_FALSE(client->Write(ETaskStatus::Finished) == sizeof(ETaskStatus));
         return true;
     }
     
     template<IsTriviallyCopyable  HeaderType>
     inline bool ServerTaskHandler<HeaderType>::ProcessTaskResult(AsyncSock::ISocketCommunicator* client)
     {
-        ASOCK_LOG("Task Result!\n");
+        // In ProcessTaskResult we assume that task chunk contexts are already on the server (there are at least 1)
+        SOCKET sock = client->GetSocket();
+
+        // firstly count amount of bytes to send
+        size_t totalNumBytes = 0;
+        for (const auto& context : m_clientTaskMap.GetAllChunkContexts(sock))
+        {
+            totalNumBytes += context->Body.size();
+        }
+        ASOCK_THROW_IF_FALSE(client->Write(totalNumBytes) == sizeof(totalNumBytes));
+
+        // copy bytes from chunks into a single range
+        std::vector<uint8_t> bytes(totalNumBytes);
+        auto it = bytes.begin();
+        for (const auto& context : m_clientTaskMap.GetAllChunkContexts(sock))
+        {
+            std::unique_lock _(context->BodyMutex);
+
+            // copy and advance
+            std::ranges::copy(context->Body, it);
+            std::advance(it, context->Body.size());
+        }
+
+        // write until totalWritten >= totalNumBytes
+        size_t totalWritten = 0;
+        while (totalWritten < totalNumBytes)
+        {
+            size_t leftToWrite = totalNumBytes - totalWritten;
+            size_t bytesWritten = client->Write(bytes.data() + totalWritten, leftToWrite);
+            totalWritten += bytesWritten;
+        }
+
+        if (totalWritten != totalNumBytes)
+        {
+            ASOCK_LOG("Written {} bytes for task result (instead of {})! This will ruin everything probs!\n",
+                totalWritten,
+                totalNumBytes);
+        }
+
+        const AsyncSock::ISocketCommunicator::AddressInfo& addressInfo = client->GetAddressInfo();
+        ASOCK_LOG("Finished writing result data for {}:{} client. Written {} bytes\n", addressInfo.IPv4, addressInfo.Port, totalWritten);
+
         return true;
     }
 
