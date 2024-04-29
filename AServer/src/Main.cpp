@@ -96,17 +96,6 @@ int32_t main()
                 matrixView.At(columnIndex, columnIndex) = localMax;
             }
 
-            /*ASOCK_LOG("\n\n[[AFTER!]] PRINTMATRIX!:\n");
-            for (size_t col = 0; col < matrixView.NumCols; ++col)
-            {
-                ASOCK_LOG("( ");
-                for (size_t row = 0; row < matrixView.NumRows; ++row)
-                {
-                    ASOCK_LOG("{} ", matrixView.At(col, row));
-                }
-                ASOCK_LOG(" )\n");
-            }*/
-
             // mark chunk as done
             ASOCK_LOG("[Chunk{}:{}] -> Done!\n", chunkID, addressInfo.Port);
             executionChunk->State = AsyncTask::EChunkState::Done;

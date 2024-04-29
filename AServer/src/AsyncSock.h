@@ -137,7 +137,7 @@ namespace AsyncSock
         Socket_t m_listenerSocket = AsyncSock::InvalidSocket;
 
         // cached client pollfds that are queried each time Server::PollRwClients is called
-        std::vector<WSAPOLLFD> m_clientRwPollfds;
+        std::vector<WSAPOLLFD> m_rwPollfds;
 
         // we need socket communicator map to retrieve communicator interface of a socket in Server::Update
         // table is filled in in Server::Accept method

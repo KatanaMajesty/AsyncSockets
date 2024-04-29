@@ -81,8 +81,20 @@ void Communicate()
     ASOCK_LOG("Press any button to start server connection\n");
     getchar();
 
-    MatrixType matrixResult = MatrixType(6); // 4x4 matrix
+    MatrixType matrixResult = MatrixType(8192); // 4x4 matrix
     Matrix_FillRandomly(matrixResult);
+
+    //ASOCK_LOG("\n\[CLIENT] MATRIX TO SUBMIT ->\n");
+    //for (size_t col = 0; col < matrixResult.NumCols; ++col)
+    //{
+    //    ASOCK_LOG("( ");
+    //    for (size_t row = 0; row < matrixResult.NumRows; ++row)
+    //    {
+    //        ASOCK_LOG("{} ", matrixResult.At(col, row));
+    //    }
+    //    ASOCK_LOG(" )\n");
+    //}
+    //ASOCK_LOG("\n");
 
     struct MatrixTaskHeader
     {
@@ -105,7 +117,7 @@ void Communicate()
     bodyPartition.Body = std::span(matrixBegin, matrixEnd);
 
     // describe chunk partitioning
-    static constexpr size_t numChunks = 1; // we want 4 chunks per task
+    static constexpr size_t numChunks = 4; // we want 4 chunks per task
     static constexpr size_t MatrixElementStride = sizeof(MatrixType::ValueType);
     const size_t numBytesPerChunk = (matrixResult.NumCols / numChunks) * matrixResult.NumRows * MatrixElementStride;
     const size_t numLeftoverBytes = (matrixResult.NumCols % numChunks) * matrixResult.NumRows * MatrixElementStride;
@@ -162,7 +174,7 @@ void Communicate()
         MatrixType::ValueType* data = (MatrixType::ValueType*)bytes.data();
         std::copy(data, data + (matrixResult.NumRows * matrixResult.NumCols), matrixResult.Elements.data());
 
-        /*ASOCK_LOG("\n\n[[AFTER]] PRINTMATRIX!:\n");
+        /*ASOCK_LOG("\n\[CLIENT] RESULT ->\n");
         for (size_t col = 0; col < matrixResult.NumCols; ++col)
         {
             ASOCK_LOG("( ");

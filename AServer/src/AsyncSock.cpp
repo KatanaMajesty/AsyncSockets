@@ -1,6 +1,7 @@
 #include "AsyncSock.h"
 
 #include <cstdint>
+#include <algorithm>
 
 namespace AsyncSock
 {
@@ -55,21 +56,35 @@ namespace AsyncSock
         // A few remarks we use in WSAPoll:
         // https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsapoll
         // we only use POLLRDNORM/POLLWRNORM flags as we dont care about others and separate ones
-        m_clientRwPollfds.clear();
-        m_clientRwPollfds.reserve(m_clients.size());
+        m_rwPollfds.clear();
+        m_rwPollfds.reserve(m_clients.size() + 1);
 
         // separately handle listener pollfd
-        WSAPOLLFD listenerPollfd = WSAPOLLFD{
+        m_rwPollfds.push_back(WSAPOLLFD{
             .fd = m_listenerSocket,
             .events = POLLRDNORM,
             .revents = 0,
-        };
+        });
 
-        // handle listener socket of a server
-        ASOCK_THROW_IF_FAILED( WSAPoll(&listenerPollfd, 1, 0) );
+        // iterate over all the clients and add them to the m_rwPollfds array 
+        // newly accepted connections will also end up in this array after Server::Accept() call
+        for (auto& pCommunicator : m_clients)
+        {
+            ClientCommunicator* client = static_cast<ClientCommunicator*>(pCommunicator.get());
+            m_rwPollfds.push_back(WSAPOLLFD{
+                .fd = client->m_client,
+                .events = POLLRDNORM | POLLWRNORM,
+                .revents = 0,
+            });
+        }
+
+        // WSAPoll, wait indefinitely, provide with std::vector of WSAPOLLFDs
+        // if failed - bail out, do not handle yet (failed if numFds == SOCKET_ERROR)
+        int32_t numFds = WSAPoll(m_rwPollfds.data(), m_rwPollfds.size(), -1);
+        ASOCK_THROW_IF_FALSE(numFds >= 0); // do not allow negative (SOCKET_ERROR and others)
 
         // if listener is ready to accept new connections - do so
-        if (listenerPollfd.revents & POLLRDNORM)
+        if (m_rwPollfds.front().revents & POLLRDNORM)
         {
             ISocketCommunicator* pCommunicator = Accept();
             ASOCK_THROW_IF_FALSE(pCommunicator != nullptr);
@@ -80,38 +95,23 @@ namespace AsyncSock
                 addressInfo.Port);
         }
 
-        // iterate over all the clients and add them to the m_clientRwPollfds array 
-        // newly accepted connections will also end up in this array after Server::Accept() call
-        for (auto& pCommunicator : m_clients)
-        {
-            ClientCommunicator* client = static_cast<ClientCommunicator*>(pCommunicator.get());
-            m_clientRwPollfds.push_back(WSAPOLLFD{
-                .fd = client->m_client,
-                .events = POLLRDNORM | POLLWRNORM,
-                .revents = 0,
-            });
-        }
-
         std::vector<ISocketCommunicator*> result;
-        if (!m_clients.empty())
+        if (m_rwPollfds.size() > 1) // at least 1 client
         {
-            // WSAPoll, wait indefinitely, provide with std::vector of WSAPOLLFDs
-            // if failed - bail out, do not handle yet (failed if numFds == SOCKET_ERROR)
-            int32_t numFds = WSAPoll(m_clientRwPollfds.data(), m_clientRwPollfds.size(), -1);
-            ASOCK_THROW_IF_FALSE(numFds >= 0); // do not allow negative (SOCKET_ERROR and others)
+            result.reserve(m_rwPollfds.size() - 1);
 
-            result.reserve(static_cast<size_t>(numFds)); // 0 is safe, reserve never shrinks
-
-            for (const WSAPOLLFD& client : m_clientRwPollfds)
-            {
-                const BOOL bIsRwSock = (client.revents & (POLLRDNORM | POLLWRNORM)) == (POLLRDNORM | POLLWRNORM);
-                if (bIsRwSock)
+            // skip listener
+            std::for_each(std::next(m_rwPollfds.begin()), m_rwPollfds.end(), 
+                [this, &result](const WSAPOLLFD& client)
                 {
-                    // this is the socket we can read from and respond to
-                    ISocketCommunicator* communicator = m_socketCommunicatorMap.at(client.fd);
-                    result.push_back(communicator);
-                }
-            }
+                    const BOOL bIsRwSock = (client.revents & (POLLRDNORM | POLLWRNORM)) == (POLLRDNORM | POLLWRNORM);
+                    if (bIsRwSock)
+                    {
+                        // this is the socket we can read from and respond to
+                        ISocketCommunicator* communicator = m_socketCommunicatorMap.at(client.fd);
+                        result.push_back(communicator);
+                    }
+                });
         }
 
         return result;
@@ -237,7 +237,8 @@ namespace AsyncSock
                 return 0;
             }
 
-            ASOCK_THROW_IF_FALSE( false );
+            // ASOCK_THROW_IF_FALSE( false );
+            return 0;
         }
 
         // here safe to assume non-negative number
