@@ -21,6 +21,8 @@
 #include <iostream>
 #include <string_view>
 
+#include "RwLockSync.h"
+
 #define ASOCK_LOG(msg, ...) (std::print(std::cout, msg, __VA_ARGS__))
 #define ASOCK_THROW_IF_FAILED(expr) \
     { \
@@ -82,6 +84,8 @@ namespace AsyncSock
 
         template<typename T> uint32_t Read(T& t) { return Read(&t, sizeof(T)); }
         template<typename T> uint32_t Write(T&& t) { return Write(&t, sizeof(T)); }
+
+        mutable RwLock CommunicatorMutex;
     };
 
     class ClientCommunicator : public ISocketCommunicator

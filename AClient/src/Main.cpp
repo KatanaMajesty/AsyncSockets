@@ -81,7 +81,7 @@ void Communicate()
     ASOCK_LOG("Press any button to start server connection\n");
     getchar();
 
-    MatrixType matrixResult = MatrixType(8192); // 4x4 matrix
+    MatrixType matrixResult = MatrixType(2048); // 4x4 matrix
     Matrix_FillRandomly(matrixResult);
 
     //ASOCK_LOG("\n\[CLIENT] MATRIX TO SUBMIT ->\n");

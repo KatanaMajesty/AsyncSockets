@@ -83,9 +83,11 @@ namespace AsyncTask
     public:
         bool HasTaskContext(SOCKET socket) const;
         TaskContext* AddTaskContext(SOCKET socket);
-        TaskContext* GetTaskContext(SOCKET socket) const { return m_contextMap.at(socket).get(); }
+        TaskContext* GetTaskContext(SOCKET socket) const;
         
     private:
+        mutable RwLock m_mapMutex;
+
         // to handle tasks easier, it is just a SOCKET key
         std::unordered_map<SOCKET, std::unique_ptr<TaskContext>> m_contextMap;
     };
@@ -157,6 +159,18 @@ namespace AsyncTask
     template<IsTriviallyCopyable  HeaderType>
     inline void ServerTaskHandler<HeaderType>::UpdateClients()
     {
+        auto work = [this](AsyncSock::ISocketCommunicator* client)
+            {
+                WriteSyncGuard _(client->CommunicatorMutex);
+
+                // we assume that first unread packet is an ERequestType type
+                ERequestType requestType = ERequestType::Invalid;
+                if (client->Read(requestType) != 0)
+                {
+                    this->ProcessClientRequest(client, requestType);
+                }
+            };
+
         // while not terminated, wait for connections and play around :)
         while (true)
         {
@@ -165,13 +179,7 @@ namespace AsyncTask
             // iterate over all clients and handle them separately, submit them to the queue
             for (AsyncSock::ISocketCommunicator* client : rwClients)
             {
-                ERequestType requestType = ERequestType::Invalid;
-
-                // we assume that first unread packet is an ERequestType type
-                if (client->Read(requestType) != 0)
-                {
-                    ProcessClientRequest(client, requestType);
-                }
+                m_workerThreadPool->SubmitTask(work, client);
             }
         }
     }
@@ -188,7 +196,7 @@ namespace AsyncTask
             // if default - just ignore and do nothing, but warn that smth is wrong with packets
         default:
             // just ignore! error messages will yield from other places
-            // ASOCK_LOG("Something might be wrong with packets from a client!\n");
+            ASOCK_LOG("Something might be wrong with packets from a client!\n");
             return;
         }
     }
@@ -196,6 +204,9 @@ namespace AsyncTask
     template<IsTriviallyCopyable  HeaderType>
     inline bool ServerTaskHandler<HeaderType>::ProcessTaskSubmition(AsyncSock::ISocketCommunicator* client)
     {
+        // Remark: communicator mutex is already acquired here from ServerTaskHandler<HeaderType>::UpdateClients()
+        //WriteSyncGuard _(client->CommunicatorMutex);
+
         // First of all check if client already has any tasks on the server
         // if so - just ignore packets. No support for different tasks from one client
         const AsyncSock::ISocketCommunicator::AddressInfo& addressInfo = client->GetAddressInfo();
@@ -243,37 +254,44 @@ namespace AsyncTask
         size_t numBytes = 0;
         ASOCK_THROW_IF_FALSE(client->Read(numBytes) == sizeof(numBytes) && numBytes > 0);
 
-        // resize body to numBytes
-        taskContext->Body.resize(numBytes);
-
-        size_t totalRead = 0;
-        while (totalRead < numBytes)
+        std::unique_lock bodyGuard(taskContext->BodyMutex);
         {
-            size_t bytesLeft = numBytes - totalRead;
-            size_t bytesRead = client->Read(taskContext->Body.data() + totalRead, bytesLeft);
-            totalRead += bytesRead;
-        }
+            // resize body to numBytes
+            taskContext->Body.resize(numBytes);
 
-        if (totalRead != numBytes)
-        {
-            ASOCK_LOG("Read {} bytes of body (instead of {})! This will ruin everything probs!\n",
-                totalRead,
-                numBytes);
-        }
+            size_t totalRead = 0;
+            while (totalRead < numBytes)
+            {
+                size_t bytesLeft = numBytes - totalRead;
+                size_t bytesRead = client->Read(taskContext->Body.data() + totalRead, bytesLeft);
+                totalRead += bytesRead;
+            }
 
+            if (totalRead != numBytes)
+            {
+                ASOCK_LOG("Read {} bytes of body (instead of {})! This will ruin everything probs!\n",
+                    totalRead,
+                    numBytes);
+            }
+
+            ASOCK_LOG("Task Submition successful! Successfully received body data from {}:{} (total of {} bytes)\n", addressInfo.IPv4, addressInfo.Port, totalRead);
+        }
+        
         // finally submit tasks to the thread pool
         for (size_t i = 0; i < numExecutionChunks; ++i)
         {
             m_workerThreadPool->SubmitTask(m_taskDelegate, header, taskContext, i);
         }
 
-        ASOCK_LOG("Task Submition successful! Successfully received body data from {}:{} (total of {} bytes)\n", addressInfo.IPv4, addressInfo.Port, totalRead);
         return true;
     }
 
     template<IsTriviallyCopyable  HeaderType>
     inline bool ServerTaskHandler<HeaderType>::ProcessTaskStatus(AsyncSock::ISocketCommunicator* client)
     {
+        // Remark: communicator mutex is already acquired here from ServerTaskHandler<HeaderType>::UpdateClients()
+        //WriteSyncGuard _(client->CommunicatorMutex);
+
         SOCKET socket = client->GetSocket();
         if (!m_clientTaskMap.HasTaskContext(socket))
         {
@@ -311,6 +329,9 @@ namespace AsyncTask
     template<IsTriviallyCopyable  HeaderType>
     inline bool ServerTaskHandler<HeaderType>::ProcessTaskResult(AsyncSock::ISocketCommunicator* client)
     {
+        // Remark: communicator mutex is already acquired here from ServerTaskHandler<HeaderType>::UpdateClients()
+        //WriteSyncGuard _(client->CommunicatorMutex);
+
         // In ProcessTaskResult we assume that task chunk contexts are already on the server (there are at least 1)
         SOCKET sock = client->GetSocket();
         TaskContext* taskContext = m_clientTaskMap.GetTaskContext(sock);
